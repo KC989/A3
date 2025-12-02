@@ -214,4 +214,6 @@ __marimo__/
 
 .idea/
 
+captions.csv
+
 venv/
