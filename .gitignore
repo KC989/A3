@@ -216,4 +216,8 @@ __marimo__/
 
 captions.csv
 
+glove.6B.300d.txt
+
+wiki-news-300d-1M.vec
+
 venv/
