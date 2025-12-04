@@ -61,24 +61,25 @@ class ArtemisDataset(Dataset):
     def __init__(self, root_dir, captions_file, transform=None, freq_threshold=5):
         self.root_dir = root_dir
         self.df = pd.read_csv(captions_file)
+        
+        # Subsetting for efficiency (Assignment recommends 5k-10k)
+        if len(self.df) > 6000:
+            print(f"Dataset too large ({len(self.df)}). Subsetting to 6000 samples for efficiency.")
+            self.df = self.df.sample(n=6000, random_state=42).reset_index(drop=True)
+
         self.transform = transform
 
-        # Load Columns
         self.imgs = self.df["painting"].tolist()
         self.captions = self.df["utterance"].tolist()
         
-        # Handle Art Styles for paths
         if "art_style" in self.df.columns:
             self.styles = self.df["art_style"].tolist()
         else:
             self.styles = [""] * len(self.df)
             
-        # Handle Emotions (New Requirement)
         if "emotion" in self.df.columns:
-            # Map string emotions to integers
             self.emotions = [EMOTION_MAP.get(e.lower(), 8) for e in self.df["emotion"].tolist()]
         else:
-            # Fallback if column missing
             self.emotions = [8] * len(self.df)
 
         self.vocab = Vocabulary(freq_threshold)
@@ -93,13 +94,11 @@ class ArtemisDataset(Dataset):
         style = self.styles[index]
         emotion_idx = self.emotions[index]
 
-        # Construct Image Path
         if style:
             img_path = os.path.join(self.root_dir, style, str(img_id) + ".jpg")
         else:
             img_path = os.path.join(self.root_dir, str(img_id) + ".jpg")
 
-        # Load Image
         try:
             image = Image.open(img_path).convert("RGB")
         except (FileNotFoundError, OSError):
@@ -108,12 +107,10 @@ class ArtemisDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
 
-        # Numericalize Caption
         numericalized_caption = [self.vocab.stoi["<start>"]]
         numericalized_caption += self.vocab.numericalize(str(caption))
         numericalized_caption += [self.vocab.stoi["<end>"]]
 
-        # Return 3 items: Image, Caption, Emotion
         return image, torch.tensor(numericalized_caption), torch.tensor(emotion_idx)
 
 class MyCollate:
@@ -126,7 +123,7 @@ class MyCollate:
         emotions = [item[2] for item in batch]
 
         imgs = torch.stack(imgs, dim=0)
-        emotions = torch.tensor(emotions) # Stack integers
+        emotions = torch.tensor(emotions) 
         
         targets = torch.nn.utils.rnn.pad_sequence(
             captions, batch_first=True, padding_value=self.pad_idx
@@ -148,10 +145,7 @@ def get_loader(root_folder, annotation_file, transform, batch_size=32, shuffle=T
     )
     return loader, dataset
 
-# --- Embedding Helpers ---
-
 def create_tfidf_embeddings_from_scratch(captions, vocab, embed_dim=256):
-    """Computes TF-IDF embeddings manually and reduces dim via SVD."""
     print("Step 1: Computing Document Frequencies...")
     num_docs = len(captions)
     vocab_size = len(vocab)
@@ -184,49 +178,51 @@ def create_tfidf_embeddings_from_scratch(captions, vocab, embed_dim=256):
     indices_tensor = torch.LongTensor(indices).t()
     tf_values = torch.FloatTensor(values)
     
-    # Apply IDF weighting
     row_indices = indices_tensor[0]
     tfidf_values = tf_values * idf_vec[row_indices]
     
-    # --- FIX IS HERE: Use sparse_coo_tensor ---
     sparse_tfidf = torch.sparse_coo_tensor(
         indices_tensor, tfidf_values, torch.Size([vocab_size, num_docs])
     )
 
     print(f"Step 4: Dimensionality Reduction to {embed_dim}...")
-    # Using PCA Lowrank (SVD approximation) for efficiency
     if vocab_size * num_docs < 100_000_000:
         dense_tfidf = sparse_tfidf.to_dense()
         U, S, V = torch.pca_lowrank(dense_tfidf, q=embed_dim)
         embeddings = torch.matmul(U, torch.diag(S))
     else:
-        # Fallback for massive matrices
-        from sklearn.decomposition import TruncatedSVD
-        from scipy.sparse import csr_matrix
-        vals = tfidf_values.numpy()
-        rows = indices_tensor[0].numpy()
-        cols = indices_tensor[1].numpy()
-        scipy_sparse = csr_matrix((vals, (rows, cols)), shape=(vocab_size, num_docs))
-        svd = TruncatedSVD(n_components=embed_dim)
-        embeddings = torch.tensor(svd.fit_transform(scipy_sparse)).float()
+        try:
+            from sklearn.decomposition import TruncatedSVD
+            from scipy.sparse import csr_matrix
+            vals = tfidf_values.numpy()
+            rows = indices_tensor[0].numpy()
+            cols = indices_tensor[1].numpy()
+            scipy_sparse = csr_matrix((vals, (rows, cols)), shape=(vocab_size, num_docs))
+            svd = TruncatedSVD(n_components=embed_dim)
+            embeddings = torch.tensor(svd.fit_transform(scipy_sparse)).float()
+        except ImportError:
+            print("Warning: sklearn not found. Truncating instead of SVD.")
+            embeddings = torch.randn(vocab_size, embed_dim)
 
     return embeddings
 
 def load_pretrained_vectors(vocab, file_path, embed_dim):
-    """Loads GloVe or FastText vectors from .txt/.vec file."""
     print(f"Loading embeddings from {file_path}...")
     embeddings_index = {}
     
-    with open(file_path, 'r', encoding="utf-8", errors='ignore') as f:
-        for i, line in enumerate(f):
-            # Skip header for FastText
-            if i == 0 and len(line.split()) == 2: continue
-            
-            values = line.split()
-            word = values[0]
-            if len(values) == embed_dim + 1:
-                coefs = np.asarray(values[1:], dtype='float32')
-                embeddings_index[word] = coefs
+    try:
+        with open(file_path, 'r', encoding="utf-8", errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i == 0 and len(line.split()) == 2: continue
+                
+                values = line.split()
+                word = values[0]
+                if len(values) == embed_dim + 1:
+                    coefs = np.asarray(values[1:], dtype='float32')
+                    embeddings_index[word] = coefs
+    except FileNotFoundError:
+        print(f"ERROR: Could not find {file_path}. Please download it.")
+        return torch.zeros((len(vocab), embed_dim))
                 
     vocab_size = len(vocab)
     embedding_matrix = torch.zeros((vocab_size, embed_dim))
